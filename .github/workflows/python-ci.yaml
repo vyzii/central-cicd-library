@@ -1,0 +1,154 @@
+name: Reusable Python CI
+
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing the Python project"
+        type: string
+        default: "."
+      python-version:
+        description: "Python version to be used for pytest and bandit" 
+        type: string
+        default: "latest"
+      dependency-group:
+        description: "uv dependency group in pyproject.toml containing pytest (and plugins)."
+        type: string
+        default: "test"
+      pytest-args:
+        description: "Extra arguments to be passed to pytest"
+        type: string
+        default: ""
+      ruff-version:
+        description: "Pinned Ruff version"
+        type: string
+        default: "0.16.8"
+      bandit-version:
+        description: "Pinned Bandit version"
+        type: string
+        default: "1.9.4"
+      trivy-severity:
+        type: string
+        default: "CRITICAL,HIGH"
+      upload-sarif:
+        type: boolean
+        default: true
+      
+
+permissions:
+  contents: read
+  security-events: write
+
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install ${{ inputs.python-version }}
+
+      - name: Run ruff check
+        uses: astral-sh/setup-ruff@v4
+        with:
+          version: ${{ inputs.ruff-version }}
+          src: ${{ inputs.working-directory }}
+          args: "check ."
+
+      - name: Run ruff format check
+        uses: astral-sh/setup-ruff@v4
+        with:
+          version: ${{ inputs.ruff-version }}
+          src: ${{ inputs.working-directory }}
+          args: "format --check ."
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+        
+      - name: Install Python
+        run: uv python install ${{ inputs.python-version }}
+
+      - name: Sync project
+        run: uv sync --locked --group ${{ inputs.dependency-group }}
+
+      - name: Run pytest
+        run: uv run pytest ${{ inputs.pytest-args }}
+
+
+  security:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Bandit SAST scan (SARIF output)
+        id: bandit-sarif
+        continue-on-error: true
+        run: > 
+          uvx --python ${{ inputs.python-version }} bandit==${{ inputs.bandit-version }}
+          -r . -c pyproject.toml -f sarif -o bandit-results.sarif
+
+      - name: Upload Bandit SARIF
+        if: inputs.upload-sarif
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ inputs.working-directory }}/bandit-results.sarif
+          category: bandit-SAST-${{ inputs.working-directory }}
+      
+      - name: Trivy SCA scan - SARIF
+        id: trivy-sarif
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.working-directory }}
+          scanners: vuln
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: inputs.upload-sarif@
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ inputs.working-directory }}/trivy-results.sarif
+          category: trivy-SCA-${{ inputs.working-directory }}
+
+      - name: Fail if Bandit or Trivy found issues
+        if: steps.bandit-serif.outcome == 'failure' || steps.trivy-sarif.outcome == 'failure'
+        run: |
+          if [ ${{ steps.bandit.outcome }} == 'failure' ]; then
+            echo "::error::Bandit SAST scan reported findings - see the Security tab for details."
+            exit 1
+          if [ ${{ steps.trivy.outcome }} == 'failure' ]; then
+            echo "::error::Trivy SCA scan reported findings - see the Security tab for details."
+            exit 1
