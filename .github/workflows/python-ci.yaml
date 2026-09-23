@@ -5,35 +5,57 @@ on:
   workflow_call:
     inputs:
       working-directory:
-        description: "Directory containing the Python project"
+        description: "Directory containing the Python project."
         type: string
         default: "."
       python-version:
-        description: "Python version to be used for pytest and bandit" 
+        description: >
+          "Python version to install and use. Overrides python-version-file. If both this and python-version-file are left empty, the
+          initialize job falls back to <working-directory>/.python-version and fails the run if that file doesn't exist either.""
         type: string
-        default: "latest"
+        default: ''
+      python-version-file:
+        description: >
+          "File defining which Python version to use (e.g. .python-version, pyproject.toml). Ignored if python-version is set. If left empty
+          (and python-version is too), defaults to <working-directory>/.python-version — see python-version."
+        type: string
+        default: ''
       dependency-group:
         description: "uv dependency group in pyproject.toml containing pytest (and plugins)."
         type: string
         default: "test"
       pytest-args:
-        description: "Extra arguments to be passed to pytest"
+        description: "Extra arguments to be passed to pytest."
         type: string
-        default: ""
+        default: ''
       ruff-version:
-        description: "Pinned Ruff version"
+        description: "Pinned Ruff version."
         type: string
         default: "0.16.8"
       bandit-version:
-        description: "Pinned Bandit version"
+        description: "Pinned Bandit version."
         type: string
         default: "1.9.4"
       trivy-severity:
+        description: "Comma separated severities Trivy should fail on."
         type: string
         default: "CRITICAL,HIGH"
-      upload-sarif:
+      upload-artifact:
+        description: "Upload .txt + SARIF security reports as a downloadable workflow artifact."
         type: boolean
         default: true
+      upload-sarif:
+        description: "Upload Bandit / Trivy SARIF to the GitHub Security tab. Requires GHAS in order to upload - will not fail if unavailable."
+        type: boolean
+        default: true
+      output-summary:
+        description: "Write human-readable Bandit / Trivy results to the job summary. Works on every repo regardless of GHAS."
+        type: boolean
+        default: true
+      retention-days:
+        description: "Days to retain the uploaded security reports."
+        type: number
+        default: 30
       
 
 permissions:
@@ -42,35 +64,56 @@ permissions:
 
 
 jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      file: ${{ steps.parse.outputs.file }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve Python version
+        id: parse
+        run: |
+          VERSION="${{ inputs.python-version }}"
+          FILE="${{ inputs.python-version-file }}"
+ 
+          if [[ -z "$VERSION" ]]; then
+            if [[ -z "$FILE" ]]; then
+              FILE="${{ inputs.working-directory }}/.python-version"
+            fi
+            if [[ ! -f "$FILE" ]]; then
+              echo "::error::Resolved python-version-file '$FILE' does not exist. Set python-version, add that file, or point python-version-file at one that exists."
+              exit 1
+            fi
+          fi
+ 
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+
   lint:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10
-        with:
-          enable-cache: true
-
-      - name: Install Python
-        run: uv python install ${{ inputs.python-version }}
-
       - name: Run ruff check
-        uses: astral-sh/setup-ruff@v4
+        uses: astral-sh/ruff-action@v4
         with:
           version: ${{ inputs.ruff-version }}
           src: ${{ inputs.working-directory }}
           args: "check ."
 
       - name: Run ruff format check
-        uses: astral-sh/setup-ruff@v4
+        uses: astral-sh/ruff-action@v4
         with:
           version: ${{ inputs.ruff-version }}
           src: ${{ inputs.working-directory }}
           args: "format --check ."
 
   test:
+    needs: initialize
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -85,7 +128,10 @@ jobs:
           enable-cache: true
         
       - name: Install Python
-        run: uv python install ${{ inputs.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ needs.initialize.outputs.version }}
+          python-version-file: ${{ needs.initialize.outputs.file }}
 
       - name: Sync project
         run: uv sync --locked --group ${{ inputs.dependency-group }}
@@ -95,6 +141,7 @@ jobs:
 
 
   security:
+    needs: initialize
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -105,50 +152,124 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10
+
+      - name: Install Python
+        uses: actions/setup-python@v7
         with:
-          enable-cache: true
+          python-version: ${{ needs.initialize.outputs.version }}
+          python-version-file: ${{ needs.initialize.outputs.file }}
 
       - name: Bandit SAST scan (SARIF output)
         id: bandit-sarif
+        if: inputs.upload-sarif == true
         continue-on-error: true
         run: > 
-          uvx --python ${{ inputs.python-version }} bandit==${{ inputs.bandit-version }}
+          uvx bandit==${{ inputs.bandit-version }}
           -r . -c pyproject.toml -f sarif -o bandit-results.sarif
 
+      - name: Bandit SAST scan (Workflow summary)
+        id: bandit-summary
+        if: inputs.output-summary == true
+        continue-on-error: true
+        run: > 
+          uvx bandit==${{ inputs.bandit-version }}
+          -r . -c pyproject.toml -f txt -o bandit-results.txt
+
       - name: Upload Bandit SARIF
-        if: inputs.upload-sarif
+        if: inputs.upload-sarif == true
+        continue-on-error: true # Avoid pipeline failure for repos without GHAS
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ inputs.working-directory }}/bandit-results.sarif
           category: bandit-SAST-${{ inputs.working-directory }}
-      
-      - name: Trivy SCA scan - SARIF
-        id: trivy-sarif
+
+      - name: Add Bandit results to job summary
+        if: inputs.output-summary == true
+        run: |
+          if [[ -s bandit-results.txt ]]; then
+            {
+              echo "### Bandit SAST — ${{ inputs.working-directory }}"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```'
+              cat bandit-results.txt
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Trivy SCA scan - JSON output
+        id: trivy
         continue-on-error: true
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: ${{ inputs.working-directory }}
           scanners: vuln
-          format: sarif
-          output: trivy-results.sarif
+          format: json
+          output: trivy-results.json
           severity: ${{ inputs.trivy-severity }}
           exit-code: "1"
           ignore-unfixed: true
 
+      - name: Convert Trivy output to SARIF
+        if: inputs.upload-sarif == true
+        continue-on-error: true
+        run: trivy convert --format sarif --output trivy-results.sarif trivy-results.json
+
+      - name: Convert Trivy output to txt
+        if: inputs.output-summary == true || inputs.upload-artifact == true
+        continue-on-error: true
+        run: trivy convert --format table trivy-results.json > trivy-results.txt
+
       - name: Upload Trivy SARIF
-        if: inputs.upload-sarif
+        if: inputs.upload-sarif == true
+        continue-on-error: true # Avoid pipeline failure for repos without GHAS
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ inputs.working-directory }}/trivy-results.sarif
           category: trivy-SCA-${{ inputs.working-directory }}
 
-      - name: Fail if Bandit or Trivy found issues
-        if: steps.bandit-serif.outcome == 'failure' || steps.trivy-sarif.outcome == 'failure'
+      - name: Add Trivy results to job summary
+        if: inputs.output-summary == true
         run: |
-          if [ ${{ steps.bandit.outcome }} == 'failure' ]; then
+          if [[ -s trivy-results.txt ]]; then
+            {
+              echo "### Trivy dependency scan — ${{ inputs.working-directory }}"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```'
+              cat trivy-results.txt
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Flatten artifact name path
+        id: artifact-name
+        run: echo "name=security-reports-$(echo '${{ inputs.working-directory }}' | tr '/.' '--')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload security report artifacts
+        if: inputs.upload-artifact == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: |
+            ${{ inputs.working-directory }}/bandit-results.sarif
+            ${{ inputs.working-directory }}/bandit-results.txt
+            ${{ inputs.working-directory }}/trivy-results.sarif
+            ${{ inputs.working-directory }}/trivy-results.txt
+          if-no-files-found: warn
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Fail if Bandit or Trivy found issues
+        if: steps.bandit-sarif.outcome == 'failure' || steps.bandit-summary.outcome == 'failure' || steps.trivy.outcome == 'failure'
+        run: |
+          if [[ ${{ steps.bandit-sarif.outcome }} == 'failure' || ${{ steps.bandit-summary.outcome }} == 'failure' ]]; then
             echo "::error::Bandit SAST scan reported findings - see the Security tab for details."
             exit 1
+          fi
           if [ ${{ steps.trivy.outcome }} == 'failure' ]; then
             echo "::error::Trivy SCA scan reported findings - see the Security tab for details."
             exit 1
+          fi
