@@ -1,0 +1,57 @@
+name: Python Test
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing the Python project."
+        type: string
+        default: "."
+      python-version:
+        description: >
+          "Python version to install and use. Overrides python-version-file. If both this and python-version-file are left empty, the
+          initialize job falls back to <working-directory>/.python-version and fails the run if that file doesn't exist either.""
+        type: string
+        default: ''
+      python-version-file:
+        description: >
+          "File defining which Python version to use (e.g. .python-version, pyproject.toml). Ignored if python-version is set. If left empty
+          (and python-version is too), defaults to <working-directory>/.python-version — see python-version."
+        type: string
+        default: ''
+      dependency-group:
+        description: "uv dependency group in pyproject.toml containing pytest (and plugins)."
+        type: string
+        default: "test"
+      pytest-args:
+        description: "Extra arguments to be passed to pytest."
+        type: string
+        default: ''
+
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+        
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          python-version-file: ${{ inputs.python-version-file }}
+
+      - name: Sync project
+        run: uv sync --locked --group ${{ inputs.dependency-group }}
+
+      - name: Run pytest
+        run: uv run pytest ${{ inputs.pytest-args }}
