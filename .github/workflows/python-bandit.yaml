@@ -36,30 +36,43 @@ on:
         type: number
         default: 30
 
-permissions:
-  contents: read
-  security-events: write
+permissions: {}
+
+env:
+  INPUTS_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+  INPUTS_PYTHON_VERSION: ${{ inputs.python-version }}
+  INPUTS_PYTHON_VERSION_FILE: ${{ inputs.python-version-file }}
+  INPUTS_BANDIT_VERSION: ${{ inputs.bandit-version }}
 
 jobs:
   bandit:
+    name: Bandit SAST Scan
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # Required for checkout to read repo contents
+      security-events: write # Required for uploading SARIF to Security tab
+
     defaults:
       run:
-        working-directory: ${{ inputs.working-directory }}
+        working-directory: ${{ env.INPUTS_WORKING_DIRECTORY }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve Python version
         id: python
         shell: bash
         run: |
-          version="${{ inputs.python-version }}"
-          file="${{ inputs.python-version-file }}"
+          version="${INPUTS_PYTHON_VERSION}"
+          file="${INPUTS_PYTHON_VERSION_FILE}"
 
           if [[ -z "$version" ]]; then
             if [[ -z "$file" ]]; then
-              file="${{ inputs.working-directory }}/.python-version"
+              file="${INPUTS_WORKING_DIRECTORY}/.python-version"
             fi
 
             if [[ "$file" = /* ]]; then
@@ -91,7 +104,7 @@ jobs:
         if: inputs.upload-sarif == true || inputs.upload-artifact == true
         continue-on-error: true
         run: >
-          uvx bandit==${{ inputs.bandit-version }}
+          uvx --from "bandit[sarif]==${INPUTS_BANDIT_VERSION}" bandit
           -r . -c pyproject.toml -f sarif -o bandit-results.sarif
 
       - name: Bandit SAST scan (text output)
@@ -99,14 +112,14 @@ jobs:
         if: inputs.output-summary == true || inputs.upload-artifact == true
         continue-on-error: true
         run: >
-          uvx bandit==${{ inputs.bandit-version }}
+          uvx "bandit==${INPUTS_BANDIT_VERSION}"
           -r . -c pyproject.toml -f txt -o bandit-results.txt
 
       - name: Bandit SAST scan
         id: enforcement
         if: inputs.upload-sarif == false && inputs.upload-artifact == false && inputs.output-summary == false
         continue-on-error: true
-        run: uvx bandit==${{ inputs.bandit-version }} -r . -c pyproject.toml
+        run: uvx "bandit==${INPUTS_BANDIT_VERSION}" -r . -c pyproject.toml
 
       - name: Upload Bandit SARIF
         if: inputs.upload-sarif == true
@@ -121,7 +134,7 @@ jobs:
         run: |
           if [[ -s bandit-results.txt ]]; then
             {
-              echo "### Bandit SAST - ${{ inputs.working-directory }}"
+              echo "### Bandit SAST - ${INPUTS_WORKING_DIRECTORY}"
               echo "<details><summary>Click to expand</summary>"
               echo ""
               echo '```'
@@ -133,8 +146,11 @@ jobs:
 
       - name: Flatten artifact name path
         id: artifact-name
+        if: inputs.upload-artifact == true
         shell: bash
-        run: echo "name=bandit-reports-$(echo '${{ inputs.working-directory }}' | tr '/.' '--')" >> "$GITHUB_OUTPUT"
+        run: |
+          name=$(printf 'bandit-reports-%s\n' "$INPUTS_WORKING_DIRECTORY" | tr '/.' '--' | sed 's/-*$//')
+          printf 'name=%s\n' "$name" >> "$GITHUB_OUTPUT"
 
       - name: Upload Bandit report artifacts
         if: inputs.upload-artifact == true
