@@ -3,7 +3,7 @@ name: Trivy Filesystem Scan
 on:
   workflow_call:
     inputs:
-      scan-ref:
+      working-directory:
         description: "Repository-relative filesystem path for Trivy to scan."
         type: string
         default: "."
@@ -28,16 +28,25 @@ on:
         type: number
         default: 30
 
-permissions:
-  contents: read
-  security-events: write
+permissions: {}
+
+env:
+  INPUTS_WORKING_DIRECTORY: ${{ inputs.working-directory }}
 
 jobs:
   trivy:
+    name: Trivy SCA Scan
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # Required for checkout to read repo contents
+      security-events: write # Required for uploading SARIF to Security tab
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Trivy dependency scan
         id: scan
@@ -45,7 +54,7 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
-          scan-ref: ${{ inputs.scan-ref }}
+          scan-ref: ${{ inputs.working-directory }}
           scanners: vuln
           format: json
           output: trivy-results.json
@@ -67,14 +76,14 @@ jobs:
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           sarif_file: trivy-results.sarif
-          category: trivy-SCA-${{ inputs.scan-ref }}
+          category: trivy-SCA-${{ inputs.working-directory }}
 
       - name: Add Trivy results to job summary
         if: inputs.output-summary == true
         run: |
           if [[ -s trivy-results.txt ]]; then
             {
-              echo "### Trivy dependency scan - ${{ inputs.scan-ref }}"
+              echo "### Trivy dependency scan - ${env.INPUTS_WORKING_DIRECTORY}"
               echo "<details><summary>Click to expand</summary>"
               echo ""
               echo '```'
@@ -87,7 +96,9 @@ jobs:
       - name: Flatten artifact name path
         id: artifact-name
         shell: bash
-        run: echo "name=trivy-reports-$(echo '${{ inputs.scan-ref }}' | tr '/.' '--')" >> "$GITHUB_OUTPUT"
+        run: |
+          name=$(printf 'trivy-reports-%s\n' "$INPUTS_WORKING_DIRECTORY" | tr '/.' '--' | sed 's/-*$//')
+          printf 'name=%s\n' "$name" >> "$GITHUB_OUTPUT"
 
       - name: Upload Trivy report artifacts
         if: inputs.upload-artifact == true
