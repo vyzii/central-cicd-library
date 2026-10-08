@@ -1,4 +1,4 @@
-name: Trivy Filesystem Scan
+name: Trivy SCA Scan
 
 on:
   workflow_call:
@@ -56,11 +56,12 @@ jobs:
           scan-type: fs
           scan-ref: ${{ inputs.working-directory }}
           scanners: vuln
+          vuln-type: library
           format: json
           output: trivy-results.json
           severity: ${{ inputs.severity }}
           exit-code: "1"
-          ignore-unfixed: true
+          ignore-unfixed: false
 
       - name: Convert Trivy output to SARIF
         if: inputs.upload-sarif == true || inputs.upload-artifact == true
