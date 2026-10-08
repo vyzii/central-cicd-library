@@ -1,0 +1,170 @@
+name: Python Bandit
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing the Python project."
+        type: string
+        default: "."
+      python-version:
+        description: "Python version to install. Overrides python-version-file."
+        type: string
+        default: ""
+      python-version-file:
+        description: "Python version file. Defaults to <working-directory>/.python-version when no version is provided."
+        type: string
+        default: ""
+      bandit-version:
+        description: "Pinned Bandit version."
+        type: string
+        default: "1.9.4"
+      upload-artifact:
+        description: "Upload text and SARIF reports as a workflow artifact."
+        type: boolean
+        default: true
+      upload-sarif:
+        description: "Upload SARIF to code scanning when available."
+        type: boolean
+        default: true
+      output-summary:
+        description: "Write human-readable results to the job summary."
+        type: boolean
+        default: true
+      retention-days:
+        description: "Days to retain uploaded reports."
+        type: number
+        default: 30
+
+permissions: {}
+
+env:
+  INPUTS_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+  INPUTS_PYTHON_VERSION: ${{ inputs.python-version }}
+  INPUTS_PYTHON_VERSION_FILE: ${{ inputs.python-version-file }}
+  INPUTS_BANDIT_VERSION: ${{ inputs.bandit-version }}
+
+jobs:
+  bandit:
+    name: Bandit SAST Scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # Required for checkout to read repo contents
+      security-events: write # Required for uploading SARIF to Security tab
+
+    defaults:
+      run:
+        working-directory: ${{ env.INPUTS_WORKING_DIRECTORY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve Python version
+        id: python
+        shell: bash
+        run: |
+          version="${INPUTS_PYTHON_VERSION}"
+          file="${INPUTS_PYTHON_VERSION_FILE}"
+
+          if [[ -z "$version" ]]; then
+            if [[ -z "$file" ]]; then
+              file="${INPUTS_WORKING_DIRECTORY}/.python-version"
+            fi
+
+            if [[ "$file" = /* ]]; then
+              resolved_file="$file"
+            else
+              resolved_file="$GITHUB_WORKSPACE/$file"
+            fi
+
+            if [[ ! -f "$resolved_file" ]]; then
+              echo "::error::Resolved python-version-file '$file' does not exist. Set python-version, add that file, or point python-version-file at one that exists."
+              exit 1
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.python.outputs.version }}
+          python-version-file: ${{ steps.python.outputs.file }}
+
+      - name: Bandit SAST scan (SARIF output)
+        id: sarif
+        if: inputs.upload-sarif == true || inputs.upload-artifact == true
+        continue-on-error: true
+        run: >
+          uvx --from "bandit[sarif]==${INPUTS_BANDIT_VERSION}" bandit
+          -r . -c pyproject.toml -f sarif -o bandit-results.sarif
+
+      - name: Bandit SAST scan (text output)
+        id: text
+        if: inputs.output-summary == true || inputs.upload-artifact == true
+        continue-on-error: true
+        run: >
+          uvx "bandit==${INPUTS_BANDIT_VERSION}"
+          -r . -c pyproject.toml -f txt -o bandit-results.txt
+
+      - name: Bandit SAST scan
+        id: enforcement
+        if: inputs.upload-sarif == false && inputs.upload-artifact == false && inputs.output-summary == false
+        continue-on-error: true
+        run: uvx "bandit==${INPUTS_BANDIT_VERSION}" -r . -c pyproject.toml
+
+      - name: Upload Bandit SARIF
+        if: inputs.upload-sarif == true
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          sarif_file: ${{ inputs.working-directory }}/bandit-results.sarif
+          category: bandit-SAST-${{ inputs.working-directory }}
+
+      - name: Add Bandit results to job summary
+        if: inputs.output-summary == true
+        run: |
+          if [[ -s bandit-results.txt ]]; then
+            {
+              echo "### Bandit SAST - ${INPUTS_WORKING_DIRECTORY}"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```'
+              cat bandit-results.txt
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Flatten artifact name path
+        id: artifact-name
+        if: inputs.upload-artifact == true
+        shell: bash
+        run: |
+          name=$(printf 'bandit-reports-%s\n' "$INPUTS_WORKING_DIRECTORY" | tr '/.' '--' | sed 's/-*$//')
+          printf 'name=%s\n' "$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Bandit report artifacts
+        if: inputs.upload-artifact == true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: |
+            ${{ inputs.working-directory }}/bandit-results.sarif
+            ${{ inputs.working-directory }}/bandit-results.txt
+          if-no-files-found: warn
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Fail if Bandit found issues
+        if: steps.sarif.outcome == 'failure' || steps.text.outcome == 'failure' || steps.enforcement.outcome == 'failure'
+        run: |
+          echo "::error::Bandit SAST scan reported findings. Review the generated reports for details."
+          exit 1
